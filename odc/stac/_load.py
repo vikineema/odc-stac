@@ -27,14 +27,16 @@ import xarray as xr
 from dask import array as da
 from dask.base import quote, tokenize
 from dask.utils import ndeepmap
-from odc.geo import CRS, XY, MaybeCRS, SomeResolution
-from odc.geo.geobox import GeoBox, GeoboxTiles
+from numpy.typing import DTypeLike
+from odc.geo import CRS, MaybeCRS, SomeResolution
+from odc.geo.geobox import GeoBox, GeoboxAnchor, GeoboxTiles
+from odc.geo.types import Unset
 from odc.geo.xr import xr_coords
-from xarray.core.npcompat import DTypeLike
 
 from ._dask import unpack_chunks
 from ._mdtools import ConversionConfig, output_geobox, parse_items, with_default
 from ._model import (
+    BandQuery,
     ParsedItem,
     RasterBandMetadata,
     RasterCollectionMetadata,
@@ -156,7 +158,7 @@ def _collection(items: Iterable[ParsedItem]) -> RasterCollectionMetadata:
 
 
 def patch_urls(
-    item: ParsedItem, edit: Callable[[str], str], bands: Optional[Iterable[str]] = None
+    item: ParsedItem, edit: Callable[[str], str], bands: BandQuery = None
 ) -> ParsedItem:
     """
     Map function over dataset measurement urls.
@@ -173,10 +175,9 @@ def patch_urls(
             for k, src in item.bands.items()
         }
     else:
-        aliases = item.collection.aliases
-        bands = set(aliases.get(b, b) for b in bands)
+        _to_edit = set(map(item.collection.band_key, bands))
         _bands = {
-            k: dataclasses.replace(src, uri=edit(src.uri) if k in bands else src.uri)
+            k: dataclasses.replace(src, uri=edit(src.uri) if k in _to_edit else src.uri)
             for k, src in item.bands.items()
         }
 
@@ -210,9 +211,9 @@ def load(
     chunks: Optional[Dict[str, int]] = None,
     pool: Union[ThreadPoolExecutor, int, None] = None,
     # Geo selection
-    crs: MaybeCRS = None,
+    crs: MaybeCRS = Unset(),
     resolution: Optional[SomeResolution] = None,
-    align: Optional[Union[float, int, XY[float]]] = None,
+    anchor: Optional[GeoboxAnchor] = None,
     geobox: Optional[GeoBox] = None,
     bbox: Optional[Tuple[float, float, float, float]] = None,
     lon: Optional[Tuple[float, float]] = None,
@@ -223,6 +224,7 @@ def load(
     geopolygon: Optional[Any] = None,
     # UI
     progress: Optional[Any] = None,
+    fail_on_error: bool = True,
     # stac related
     stac_cfg: Optional[ConversionConfig] = None,
     patch_url: Optional[Callable[[str], str]] = None,
@@ -291,6 +293,9 @@ def load(
     :param progress:
        Pass in ``tqdm`` progress bar or similar, only used in non-Dask load.
 
+    :param fail_on_error:
+        Set this to ``False`` to skip over load failures.
+
     :param pool:
        Use thread pool to perform load locally, only used in non-Dask load.
 
@@ -329,13 +334,17 @@ def load(
     regardless of the requested bounding box.
 
     :param crs:
-       Load data in a given CRS
+       Load data in a given CRS. Special name of ``"utm"`` is also understood, in which case an
+       appropriate UTM projection will be picked based on the output bounding box.
 
     :param resolution:
-       Set resolution of output in ``Y, X`` order, it is common for ``Y`` to be negative,
-       e.g. ``resolution=(-10, 10)``. Resolution must be supplied in the units of the
-       output CRS, so they are commonly in meters for *Projected* and in degrees for
-       *Geographic* CRSs. ``resolution=10`` is equivalent to ``resolution=(-10, 10)``.
+       Set resolution of output in units of the output CRS. This can be a single float, in which
+       case pixels are assumed to be square with ``Y`` axis flipped. To specify non-square or
+       non-flipped pixels use :py:func:`odc.geo.resxy_` or :py:func:`odc.geo.resyx_`.
+       ``resolution=10`` is equivalent to ``resolution=odc.geo.resxy_(10, -10)``.
+
+       Resolution must be supplied in the units of the output CRS. Units are commonly meters
+       for *Projected* and degrees for *Geographic* CRSs.
 
     :param bbox:
        Specify bounding box in Lon/Lat. ``[min(lon), min(lat), max(lon), max(lat)]``
@@ -350,9 +359,10 @@ def load(
     :param y:
        Define output bounds in output projection coordinate units
 
-    :param align:
-       Control pixel snapping, default is to align pixel grid to ``X``/``Y``
-       axis such that pixel edges lie on the axis.
+    :param anchor:
+       Controls pixel snapping, default is to align pixel grid to ``X``/``Y``
+       axis such that pixel edges align with ``x=0, y=0``. Other common option is to
+       align pixel centers to ``0,0`` rather than edges.
 
     :param geobox:
        Allows to specify exact region/resolution/projection using
@@ -448,7 +458,7 @@ def load(
 
     # normalize args
     # dc.load compatible name for crs is `output_crs`
-    if crs is None:
+    if isinstance(crs, Unset) or crs is None:
         crs = cast(MaybeCRS, kw.pop("output_crs", None))
 
     if groupby is None:
@@ -462,7 +472,8 @@ def load(
         bands=bands,
         crs=crs,
         resolution=resolution,
-        align=align,
+        anchor=anchor,
+        align=kw.get("align", None),
         geobox=geobox,
         like=like,
         geopolygon=geopolygon,
@@ -498,6 +509,7 @@ def load(
         dtype=dtype,
         use_overviews=kw.get("use_overviews", True),
         nodata=kw.get("nodata", None),
+        fail_on_error=fail_on_error,
     )
 
     if patch_url is not None:
@@ -551,6 +563,7 @@ def load(
                 srcs = [(idx, band_name) for idx in tyx_bins.get(tyx_idx, [])]
                 yield _LoadChunkTask(band_name, srcs, cfg, gbt, tyx_idx)
 
+    _rio_env = _capture_rio_env()
     if chunks is not None:
         # Dask case: dummy for now
         _loader = _DaskGraphBuilder(
@@ -558,7 +571,7 @@ def load(
             _parsed,
             tyx_bins,
             gbt,
-            _capture_rio_env(),
+            _rio_env,
         )
         return _with_debug_info(_mk_dataset(gbox, tss, load_cfg, _loader))
 
@@ -573,8 +586,13 @@ def load(
             _tasks.append(task)
 
         dst_slice = ds[task.band].data[task.dst_roi]
-        srcs = [_parsed[idx][band] for idx, band in task.srcs]
-        _ = _fill_2d_slice(srcs, task.dst_gbox, task.cfg, dst_slice)
+        srcs = [
+            src
+            for src in (_parsed[idx].get(band, None) for idx, band in task.srcs)
+            if src is not None
+        ]
+        with rio_env(**_rio_env):
+            _ = _fill_2d_slice(srcs, task.dst_gbox, task.cfg, dst_slice)
         t, y, x = task.idx_tyx
         return (task.band, t, y, x)
 
@@ -595,6 +613,7 @@ def _resolve_load_cfg(
     dtype: Union[DTypeLike, Dict[str, DTypeLike], None] = None,
     use_overviews: bool = True,
     nodata: Optional[float] = None,
+    fail_on_error: bool = True,
 ) -> Dict[str, RasterLoadParams]:
     def _dtype(name: str, band_dtype: Optional[str], fallback: str) -> str:
         if dtype is None:
@@ -626,6 +645,7 @@ def _resolve_load_cfg(
             fill_value=_fill_value(band),
             use_overviews=use_overviews,
             resampling=_resampling(name, "nearest"),
+            fail_on_error=fail_on_error,
         )
 
     return {name: _resolve(name, band) for name, band in bands.items()}
@@ -639,11 +659,9 @@ def _dask_loader_tyx(
     env: Dict[str, Any],
 ):
     assert cfg.dtype is not None
-    env = {**env}
-    session = env.pop("_aws", None)
     gbox = gbt[iyx]
     chunk = np.empty(gbox.shape.yx, dtype=cfg.dtype)
-    with rio_env(session, **env):
+    with rio_env(**env):
         return _fill_2d_slice(srcs, gbox, cfg, chunk)[np.newaxis]
 
 
@@ -807,11 +825,10 @@ def _group_items(
 
 
 def _tiles(item: ParsedItem, gbt: GeoboxTiles) -> Iterator[Tuple[int, int]]:
-    # TODO: should probably prefer native geometry if set in proj
-    # TODO: extract geometry from geobox if proj data is available
-    if item.geometry is None:
+    geom = item.safe_geometry(gbt.base.crs)
+    if geom is None:
         raise ValueError("Can not process items without defined footprint")
-    yield from gbt.tiles(item.geometry)
+    yield from gbt.tiles(geom)
 
 
 def _tyx_bins(

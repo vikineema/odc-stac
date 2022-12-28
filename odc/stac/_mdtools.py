@@ -7,7 +7,6 @@ Utilities for translating STAC Items to EO3 Datasets.
 import datetime
 from collections import Counter
 from copy import copy
-from functools import partial
 from typing import (
     Any,
     Dict,
@@ -21,7 +20,6 @@ from typing import (
     TypeVar,
     Union,
 )
-from warnings import warn
 
 import pystac.asset
 import pystac.collection
@@ -37,19 +35,23 @@ from odc.geo import (
     Resolution,
     SomeResolution,
     geom,
+    res_,
     wh_,
     xy_,
 )
-from odc.geo.crs import norm_crs
-from odc.geo.geobox import GeoBox
+from odc.geo.geobox import AnchorEnum, GeoBox, GeoboxAnchor
+from odc.geo.types import Unset
 from odc.geo.xr import ODCExtension
 from pystac.extensions.eo import EOExtension
 from pystac.extensions.item_assets import ItemAssetsExtension
 from pystac.extensions.projection import ProjectionExtension
-from pystac.extensions.raster import RasterExtension
+from pystac.extensions.raster import RasterBand, RasterExtension
 from toolz import dicttoolz
 
 from ._model import (
+    BandKey,
+    BandQuery,
+    MDParseConfig,
     ParsedItem,
     RasterBandMetadata,
     RasterCollectionMetadata,
@@ -58,8 +60,6 @@ from ._model import (
 
 T = TypeVar("T")
 ConversionConfig = Dict[str, Any]
-
-BAND_DEFAULTS = RasterBandMetadata("float32", None, "1")
 
 EPSG4326 = CRS("EPSG:4326")
 
@@ -83,33 +83,49 @@ def with_default(v: Optional[T], default_value: T) -> T:
     return v
 
 
+def _band_metadata_raw(asset: pystac.asset.Asset) -> List[RasterBand]:
+    bands = asset.to_dict().get("raster:bands", None)
+    if bands is None:
+        return []
+    return [RasterBand(props) for props in bands]
+
+
 def band_metadata(
     asset: pystac.asset.Asset, default: RasterBandMetadata
-) -> RasterBandMetadata:
+) -> List[RasterBandMetadata]:
     """
     Compute band metadata from Asset raster extension with defaults from default.
 
     :param asset: Asset with raster extension
     :param default: Values to use for fallback
-    :return: BandMetadata tuple constructed from raster:bands metadata
+    :return: List of BandMetadata constructed from raster:bands metadata
     """
+    bands: List[RasterBand] = []
     try:
         rext = RasterExtension.ext(asset)
+        if rext.bands is not None:
+            bands = rext.bands
     except pystac.errors.ExtensionNotImplemented:
-        return default
+        bands = _band_metadata_raw(asset)
 
-    if rext.bands is None or len(rext.bands) == 0:
-        return default
+    if len(bands) == 0:
+        return [default]
 
-    if len(rext.bands) > 1:
-        warn(f"Defaulting to first band of {len(rext.bands)}")
-    band = rext.bands[0]
+    def _norm_nodata(nodata) -> Union[float, None]:
+        if nodata is None:
+            return None
+        if isinstance(nodata, (int, float)):
+            return nodata
+        return float(nodata)
 
-    return RasterBandMetadata(
-        with_default(band.data_type, default.data_type),
-        with_default(band.nodata, default.nodata),
-        with_default(band.unit, default.unit),
-    )
+    return [
+        RasterBandMetadata(
+            with_default(band.data_type, default.data_type),
+            with_default(_norm_nodata(band.nodata), default.nodata),
+            with_default(band.unit, default.unit),
+        )
+        for band in bands
+    ]
 
 
 def has_proj_ext(item: Union[pystac.item.Item, pystac.collection.Collection]) -> bool:
@@ -124,6 +140,23 @@ def has_proj_ext(item: Union[pystac.item.Item, pystac.collection.Collection]) ->
         return True
     except pystac.errors.ExtensionNotImplemented:
         return False
+
+
+def has_raster_ext(item: Union[pystac.item.Item, pystac.collection.Collection]) -> bool:
+    """
+    Check if STAC Item/Collection have EOExtension.
+
+    :returns: ``True`` if Raster exetension is enabled
+    :returns: ``False`` if no Rasetr extension was found
+    """
+    try:
+        RasterExtension.validate_has_extension(item, add_if_missing=False)
+        return True
+    except pystac.errors.ExtensionNotImplemented:
+        return any(
+            ext_name.startswith("https://stac-extensions.github.io/raster/")
+            for ext_name in item.stac_extensions
+        )
 
 
 def has_proj_data(asset: pystac.asset.Asset) -> bool:
@@ -329,74 +362,49 @@ def band2grid_from_gsd(assets: Dict[str, pystac.asset.Asset]) -> Dict[str, str]:
     return band2grid
 
 
-def alias_map_from_eo(item: pystac.item.Item, quiet: bool = False) -> Dict[str, str]:
+def _extract_aliases(
+    asset_name: str, asset: pystac.asset.Asset, block_list: Set[str]
+) -> Iterator[Tuple[str, int, BandKey]]:
+    try:
+        eo = EOExtension.ext(asset)
+    except pystac.errors.ExtensionNotImplemented:
+        return
+    if eo.bands is None:
+        return
+
+    for idx, band in enumerate(eo.bands):
+        for alias in [band.name, band.common_name]:
+            if alias is not None and alias not in block_list:
+                yield (alias, len(eo.bands), (asset_name, idx + 1))
+
+
+def alias_map_from_eo(item: pystac.item.Item) -> Dict[str, List[BandKey]]:
     """
     Generate mapping ``common name -> canonical name``.
 
-    For all unique common names defined on the Item eo extension record mapping to the canonical
-    name. Non-unique common names are ignored with a warning unless ``quiet`` flag is set.
+    For all unique common names defined on the Item's assets via the eo
+    extension, record a mapping to the asset key ("canonical name"). Non-unique
+    common names are ignored with a warning unless ``quiet`` flag is set.
 
     :param item: STAC :class:`~pystac.item.Item` to process
-    :param quiet: Do not print warning if duplicate common names are found, defaults to False
-    :return: common name to canonical name mapping
+    :return: common name to (asset, idx) mapping
     """
-    try:
-        bands = EOExtension.ext(item, add_if_missing=False).bands
-    except pystac.errors.ExtensionNotImplemented:
-        return {}
+    aliases: Dict[str, List[BandKey]] = {}
 
-    if bands is None:
-        return {}  # pragma: no cover
+    asset_band_counts: Dict[str, int] = {}
+    asset_names = set(item.assets)
+    for asset_name, asset in item.assets.items():
+        for alias, count, bkey in _extract_aliases(asset_name, asset, asset_names):
+            aliases.setdefault(alias, []).append(bkey)
+            asset_band_counts[asset_name] = count
 
-    common_names: Dict[str, Set[str]] = {}
-    for band in bands:
-        common_name = band.common_name
-        if common_name is not None:
-            common_names.setdefault(common_name, set()).add(band.name)
+    # Alias pointing to an asset with fewer bands is
+    # of higher priority, 1-band data asset vs 3 band visual
+    def _cmp(x):
+        asset, _ = x
+        return (asset_band_counts[asset], asset)
 
-    def _aliases(common_names):
-        for alias, bands in common_names.items():
-            if len(bands) == 1:
-                (band,) = bands
-                yield (alias, band)
-            elif not quiet:
-                warn(f"Common name `{alias}` is repeated, skipping")
-
-    return dict(_aliases(common_names))
-
-
-def normalise_product_name(name: str) -> str:
-    """
-    Create valid product name from an arbitrary string.
-
-    Right now just maps ``-`` and `` `` to ``_``.
-
-    :param name: Usually comes from ``collection_id``.
-    """
-    # TODO: for now just map `-`,` ` to `_`
-    return name.replace("-", "_").replace(" ", "_")
-
-
-def norm_band_metadata(
-    v: Union[RasterBandMetadata, Dict[str, Any]],
-    fallback: RasterBandMetadata = BAND_DEFAULTS,
-) -> RasterBandMetadata:
-    if isinstance(v, RasterBandMetadata):
-        return v
-    return RasterBandMetadata(
-        v.get("data_type", fallback.data_type),
-        v.get("nodata", fallback.nodata),
-        v.get("unit", fallback.unit),
-    )
-
-
-def _norm_band_cfg(
-    cfg: Dict[str, Any]
-) -> Tuple[RasterBandMetadata, Dict[str, RasterBandMetadata]]:
-    fallback = norm_band_metadata(cfg.get("*", {}))
-    return fallback, {
-        k: norm_band_metadata(v, fallback) for k, v in cfg.items() if k != "*"
-    }
+    return {alias: sorted(bands, key=_cmp) for alias, bands in aliases.items()}
 
 
 def mk_sample_item(collection: pystac.collection.Collection) -> pystac.item.Item:
@@ -436,6 +444,143 @@ def _collection_id(item: pystac.item.Item) -> str:
     return str(item.collection_id)
 
 
+class _CMDAssembler:
+    """
+    Incrementally build up collection metadata from item stream.
+
+    Expect to see items of the same collection only.
+    """
+
+    # pylint: disable=too-few-public-methods
+
+    def __init__(
+        self, collection_id: str, cfg: Optional[ConversionConfig] = None
+    ) -> None:
+        if cfg is None:
+            cfg = {}
+
+        self._cfg = MDParseConfig.from_dict(collection_id, cfg)
+        self.check_proj: bool = not self._cfg.ignore_proj
+        self.has_proj: Optional[bool] = None
+        self.collection_id = collection_id
+        self.md: Optional[RasterCollectionMetadata] = None
+        self._asset_keeps: Dict[str, bool] = {}
+        self._known_assets: Set[str] = set()
+
+    def _keep(self, kv: Tuple[str, pystac.asset.Asset]) -> bool:
+        c = self._cfg
+        name, asset = kv
+        if name in c.band_cfg:
+            return True
+        assert self.has_proj is not None
+        return is_raster_data(asset, check_proj=self.has_proj)
+
+    def _extract_bands(
+        self, name: str, asset: pystac.asset.Asset
+    ) -> Dict[BandKey, RasterBandMetadata]:
+        c = self._cfg
+        bm = c.band_cfg.get(name, None)
+        if bm is not None:
+            return {(name, 1): copy(bm)}
+
+        return {
+            (name, idx + 1): bm
+            for idx, bm in enumerate(band_metadata(asset, c.band_defaults))
+        }
+
+    def _bootstrap(self, item: pystac.item.Item):
+        """Called on the very first item only."""
+        self.has_proj = has_proj_ext(item) if self.check_proj else False
+        data_bands: Dict[str, pystac.asset.Asset] = dicttoolz.itemfilter(
+            self._keep, item.assets
+        )
+
+        # found no data bands with check_proj=True
+        # so try again with check_proj=False
+        if len(data_bands) == 0 and self.has_proj:
+            self.has_proj = False
+            self.check_proj = False
+            data_bands = dicttoolz.itemfilter(self._keep, item.assets)
+
+        self._asset_keeps = {name: name in data_bands for name in item.assets}
+        self._known_assets = set(self._asset_keeps)
+
+        bands: Dict[BandKey, RasterBandMetadata] = {}
+        aliases = alias_map_from_eo(item)
+
+        # 1. If band in user config -- use that
+        # 2. Use data from raster extension (with fallback to "*" config)
+        # 3. Use config for "*" from user config as fallback
+        for name, asset in data_bands.items():
+            bands.update(self._extract_bands(name, asset))
+
+        for alias, bkey in self._cfg.aliases.items():
+            aliases.setdefault(alias, []).insert(0, bkey)
+
+        # We assume that grouping of data bands into grids is consistent across
+        # entire collection, so we compute it once and keep it
+        if self.has_proj:
+            _, band2grid = compute_eo3_grids(data_bands)
+        else:
+            band2grid = band2grid_from_gsd(data_bands)
+
+        self.md = RasterCollectionMetadata(
+            self.collection_id,
+            bands=bands,
+            aliases=aliases,
+            has_proj=self.has_proj,
+            band2grid=band2grid,
+        )
+
+    def update(self, item: pystac.item.Item):
+        # pylint: disable=too-many-locals,too-many-branches
+        if self.md is None:
+            self._bootstrap(item)
+            return
+
+        new_assets = set(item.assets) - self._known_assets
+        if len(new_assets) == 0:
+            return
+
+        new_data_assets: List[Tuple[str, pystac.asset.Asset]] = []
+        for name in new_assets:
+            asset = item.assets[name]
+            is_data = self._keep((name, asset))
+            self._asset_keeps[name] = is_data
+            if is_data:
+                new_data_assets.append((name, asset))
+        self._known_assets = set(self._asset_keeps)
+
+        # some new assets that we don't care about
+        if len(new_data_assets) == 0:
+            return
+
+        bands = self.md.bands
+        aliases = self.md.aliases
+        band2grid = self.md.band2grid
+
+        # GeoBox -> grid name
+        grid2band: Dict[GeoBox, str] = {}
+        if self.has_proj:
+            for name, asset in item.assets.items():
+                if (grid_name := band2grid.get(name, None)) is not None:
+                    grid2band[asset_geobox(asset)] = grid_name
+
+        for name, asset in new_data_assets:
+            bands.update(self._extract_bands(name, asset))
+
+            # update alias table
+            for alias, count, bkey in _extract_aliases(name, asset, self._known_assets):
+                _bands = aliases.setdefault(alias, [])
+                if count == 1:
+                    _bands.insert(0, bkey)
+                else:
+                    _bands.append(bkey)
+
+            if self.has_proj:
+                band2grid[name] = grid2band.get(asset_geobox(asset), f"grid-{name}")
+
+
 def extract_collection_metadata(
     item: pystac.item.Item, cfg: Optional[ConversionConfig] = None
 ) -> RasterCollectionMetadata:
@@ -451,70 +596,16 @@ def extract_collection_metadata(
     :param cfg: Optional user configuration
     :return: :py:class:`~odc.stac._model.RasterCollectionMetadata`
     """
-    # TODO: split this in-to smaller functions
-    # pylint: disable=too-many-locals
-    if cfg is None:
-        cfg = {}
-
     collection_id = _collection_id(item)
-
-    _cfg = copy(cfg.get("*", {}))
-    _cfg.update(cfg.get(collection_id, {}))
-    quiet = _cfg.get("warnings", "all") == "ignore"
-    ignore_proj: bool = _cfg.get("ignore_proj", False)
-    band_defaults, band_cfg = _norm_band_cfg(_cfg.get("assets", {}))
-
-    def _keep(kv, check_proj):
-        name, asset = kv
-        if name in band_cfg:
-            return True
-        return is_raster_data(asset, check_proj=check_proj)
-
-    has_proj = False if ignore_proj else has_proj_ext(item)
-    data_bands: Dict[str, pystac.asset.Asset] = dicttoolz.itemfilter(
-        partial(_keep, check_proj=has_proj), item.assets
-    )
-    if len(data_bands) == 0 and has_proj is True:
-        # Proj is enabled but no Asset has all the proj data
-        has_proj = False
-        data_bands = dicttoolz.itemfilter(partial(_keep, check_proj=False), item.assets)
-        _cfg.update(ignore_proj=True)
-
-    if len(data_bands) == 0:
-        raise ValueError("Unable to find any bands")
-
-    bands: Dict[str, RasterBandMetadata] = {}
-
-    # 1. If band in user config -- use that
-    # 2. Use data from raster extension (with fallback to "*" config)
-    # 3. Use config for "*" from user config as fallback
-    for name, asset in data_bands.items():
-        bm = band_cfg.get(name, None)
-        if bm is None:
-            bm = band_metadata(asset, band_defaults)
-        bands[name] = copy(bm)
-
-    aliases = alias_map_from_eo(item, quiet=quiet)
-    aliases.update(_cfg.get("aliases", {}))
-
-    # We assume that grouping of data bands into grids is consistent across
-    # entire collection, so we compute it once and keep it
-    if has_proj:
-        _, band2grid = compute_eo3_grids(data_bands)
-    else:
-        band2grid = band2grid_from_gsd(data_bands)
-
-    return RasterCollectionMetadata(
-        collection_id,
-        bands=bands,
-        aliases=aliases,
-        has_proj=has_proj,
-        band2grid=band2grid,
-    )
+    proc = _CMDAssembler(collection_id, cfg)
+    proc.update(item)
+    assert proc.md is not None
+    return proc.md
 
 
 def parse_item(
-    item: pystac.item.Item, template: RasterCollectionMetadata
+    item: pystac.item.Item,
+    template: Union[RasterCollectionMetadata, ConversionConfig, None] = None,
 ) -> ParsedItem:
     """
     Extract raster band information relevant for data loading.
@@ -524,12 +615,15 @@ def parse_item(
     :return: ``ParsedItem``
     """
     # pylint: disable=too-many-locals
+    if not isinstance(template, RasterCollectionMetadata):
+        template = extract_collection_metadata(item, template)
+
     band2grid = template.band2grid
     has_proj = False if template.has_proj is False else has_proj_ext(item)
     _assets = item.assets
 
     _grids: Dict[str, GeoBox] = {}
-    bands: Dict[str, RasterSource] = {}
+    bands: Dict[BandKey, RasterSource] = {}
     geometry: Optional[Geometry] = None
 
     if item.geometry is not None:
@@ -543,22 +637,22 @@ def parse_item(
         _grids[grid_name] = grid
         return grid
 
-    for band, meta in template.bands.items():
-        asset = _assets.get(band)
+    for bk, meta in template.bands.items():
+        asset_name, _ = bk
+        asset = _assets.get(asset_name)
         if asset is None:
-            warn(f"Missing asset with name: {band}")
             continue
 
-        grid_name = band2grid.get(band, "default")
+        grid_name = band2grid.get(asset_name, "default")
         geobox: Optional[GeoBox] = _get_grid(grid_name, asset) if has_proj else None
 
         uri = asset.get_absolute_href()
         if uri is None:
             raise ValueError(
-                f"Can not determine absolute path for band: {band}"
+                f"Can not determine absolute path for band: {asset_name}"
             )  # pragma: no cover (https://github.com/stac-utils/pystac/issues/754)
 
-        bands[band] = RasterSource(uri=uri, geobox=geobox, meta=meta)
+        bands[bk] = RasterSource(uri=uri, geobox=geobox, meta=meta)
 
     md = item.common_metadata
     return ParsedItem(
@@ -575,16 +669,17 @@ def parse_item(
 def parse_items(
     items: Iterable[pystac.item.Item], cfg: Optional[ConversionConfig] = None
 ) -> Iterator[ParsedItem]:
-    md_cache: Dict[str, RasterCollectionMetadata] = {}
+    proc_cache: Dict[str, _CMDAssembler] = {}
 
     for item in items:
         collection_id = _collection_id(item)
-        md = md_cache.get(collection_id)
-        if md is None:
-            md = extract_collection_metadata(item, cfg)
-            md_cache[collection_id] = md
+        proc = proc_cache.get(collection_id, None)
+        if proc is None:
+            proc = _CMDAssembler(collection_id, cfg)
+            proc_cache[collection_id] = proc
 
-        yield parse_item(item, md)
+        proc.update(item)
+        yield parse_item(item, proc.md)
 
 
 def _auto_load_params(
@@ -606,28 +701,6 @@ def _auto_load_params(
     return (crs, res)
 
 
-def _geojson_to_shapely(xx: Any) -> shapely.geometry.base.BaseGeometry:
-    _type = xx.get("type", None)
-
-    if _type is None:
-        raise ValueError("Not a valid GeoJSON")
-
-    _type = _type.lower()
-    if _type == "featurecollection":
-        features = xx.get("features", [])
-        if len(features) == 1:
-            return shapely.geometry.shape(features[0]["geometry"])
-
-        return shapely.geometry.GeometryCollection(
-            [shapely.geometry.shape(feature["geometry"]) for feature in features]
-        )
-
-    if _type == "feature":
-        return shapely.geometry.shape(xx["geometry"])
-
-    return shapely.geometry.shape(xx)
-
-
 def _normalize_geometry(xx: Any) -> Geometry:
     if isinstance(xx, shapely.geometry.base.BaseGeometry):
         return Geometry(xx, "epsg:4326")
@@ -636,7 +709,7 @@ def _normalize_geometry(xx: Any) -> Geometry:
         return xx
 
     if isinstance(xx, dict):
-        return Geometry(_geojson_to_shapely(xx), "epsg:4326")
+        return Geometry(xx, "epsg:4326")
 
     # GeoPandas
     _geo = getattr(xx, "__geo_interface__", None)
@@ -644,24 +717,52 @@ def _normalize_geometry(xx: Any) -> Geometry:
         raise ValueError("Can't interpret value as geometry")
 
     _crs = getattr(xx, "crs", "epsg:4326")
-    return Geometry(_geojson_to_shapely(_geo), _crs)
+    return Geometry(_geo, _crs)
 
 
-def _compute_bbox(items: Iterable[ParsedItem], crs: CRS) -> geom.BoundingBox:
-    def _bbox(item: ParsedItem) -> geom.BoundingBox:
-        g = item.geometry
-        assert g is not None
-        return g.to_crs(crs).boundingbox
+def _compute_bbox(
+    items: Iterable[ParsedItem],
+    crs: MaybeCRS,
+    bands: BandQuery = None,
+) -> geom.BoundingBox:
+    def bboxes(items: Iterable[ParsedItem]) -> Iterator[geom.BoundingBox]:
+        crs0 = crs
+        for item in items:
+            g = item.safe_geometry(crs0, bands=bands)
+            assert g is not None
+            if crs0 is crs:
+                # If crs is something like "utm", make sure
+                # same one is used going forward
+                crs0 = g.crs
+            yield g.boundingbox
 
-    return geom.bbox_union(map(_bbox, items))
+    return geom.bbox_union(bboxes(items))
+
+
+def _align2anchor(
+    align: Optional[Union[float, int, XY[float]]], resolution: SomeResolution
+) -> GeoboxAnchor:
+    if align is None:
+        return AnchorEnum.EDGE
+
+    if isinstance(align, (float, int)):
+        align = xy_(align, align)
+
+    # support old-style "align", which is basically anchor but in CRS units
+    ax, ay = align.xy
+    if ax == 0 and ay == 0:
+        return AnchorEnum.EDGE
+    resolution = res_(resolution)
+    return xy_(ax / abs(resolution.x), ay / abs(resolution.y))
 
 
 def output_geobox(
     items: Sequence[ParsedItem],
     bands: Optional[Sequence[str]] = None,
     *,
-    crs: MaybeCRS = None,
+    crs: MaybeCRS = Unset(),
     resolution: Optional[SomeResolution] = None,
+    anchor: Optional[GeoboxAnchor] = None,
     align: Optional[Union[float, int, XY[float]]] = None,
     geobox: Optional[GeoBox] = None,
     like: Optional[Any] = None,
@@ -680,7 +781,7 @@ def output_geobox(
     # x,y,crs      --> geopolygon[crs]
     # [items]      --> crs, geopolygon[crs]
     # [items]      --> crs, resolution
-    # geopolygon, crs, resolution[, align] --> GeoBox
+    # geopolygon, crs, resolution[, anchor|align] --> GeoBox
 
     params = {
         k
@@ -692,18 +793,17 @@ def output_geobox(
             crs=crs,
             resolution=resolution,
             align=align,
+            anchor=anchor,
             like=like,
             geopolygon=geopolygon,
             bbox=bbox,
             geobox=geobox,
         ).items()
-        if v is not None
+        if not (v is None or isinstance(v, Unset))
     }
-    if align is not None:
-        if isinstance(align, (int, float)):
-            align = xy_(align, align)
 
-    def report_extra_args(args: Set[str], primary: str):
+    def report_extra_args(primary: str, *ok_args):
+        args = params - set([primary, *ok_args])
         if len(args) > 0:
             raise ValueError(
                 f"Too many arguments when using `{primary}=`: {','.join(args)}"
@@ -716,9 +816,10 @@ def output_geobox(
         return False
 
     if geobox is not None:
-        report_extra_args(params - {"geobox"}, "geobox")
+        report_extra_args("geobox")
         return geobox
     if like is not None:
+        report_extra_args("like")
         if isinstance(like, GeoBox):
             return like
         _odc = getattr(like, "odc", None)
@@ -729,7 +830,7 @@ def output_geobox(
         if _odc.geobox is None:
             raise ValueError("No geospatial info on `like=` input")
 
-        report_extra_args(params - {"like"}, "like")
+        assert isinstance(_odc.geobox, GeoBox)
         return _odc.geobox
 
     if not check_arg_sets("x", "y"):
@@ -738,7 +839,11 @@ def output_geobox(
     if not check_arg_sets("lon", "lat"):
         raise ValueError("Need to supply both lon= and lat=")
 
-    crs = norm_crs(crs)
+    if isinstance(crs, Unset):
+        crs = None
+
+    grid_params = ("crs", "align", "anchor", "resolution")
+
     query_crs: Optional[CRS] = None
     if geopolygon is not None:
         geopolygon = _normalize_geometry(geopolygon)
@@ -746,25 +851,21 @@ def output_geobox(
 
     # Normalize  x.y|lon.lat|bbox|geopolygon arguments to a geopolygon|None
     if geopolygon is not None:
-        report_extra_args(
-            params - {"geopolygon", "crs", "align", "resolution"}, "geopolygon"
-        )
+        report_extra_args("geopolygon", *grid_params)
     elif bbox is not None:
-        report_extra_args(params - {"bbox", "crs", "align", "resolution"}, "bbox")
+        report_extra_args("bbox", *grid_params)
         x0, y0, x1, y1 = bbox
         geopolygon = geom.box(x0, y0, x1, y1, EPSG4326)
     elif lat is not None and lon is not None:
         # lon=(x0, x1), lat=(y0, y1)
-        report_extra_args(
-            params - {"lon", "lat", "crs", "align", "resolution"}, "lon,lat"
-        )
+        report_extra_args("lon,lat", "lon", "lat", *grid_params)
         x0, x1 = sorted(lon)
         y0, y1 = sorted(lat)
         geopolygon = geom.box(x0, y0, x1, y1, EPSG4326)
     elif x is not None and y is not None:
         if crs is None:
             raise ValueError("Need to supply `crs=` when using `x=`, `y=`.")
-        report_extra_args(params - {"x", "y", "crs", "align", "resolution"}, "x,y")
+        report_extra_args("x,y", "x", "y", *grid_params)
         x0, x1 = sorted(x)
         y0, y1 = sorted(y)
         geopolygon = geom.box(x0, y0, x1, y1, crs)
@@ -785,13 +886,18 @@ def output_geobox(
         if resolution is None or crs is None:
             return None
 
+    if anchor is None:
+        anchor = _align2anchor(align, resolution)
+
     if geopolygon is not None:
         assert isinstance(geopolygon, Geometry)
         return GeoBox.from_geopolygon(
-            geopolygon, resolution=resolution, crs=crs, align=align
+            geopolygon,
+            resolution=resolution,
+            crs=crs,
+            anchor=anchor,
         )
 
     # compute from parsed items
-    x0, y0, x1, y1 = _compute_bbox(items, crs)
-    geopolygon = geom.box(x0, y0, x1, y1, crs)
-    return GeoBox.from_geopolygon(geopolygon, resolution=resolution, align=align)
+    _bbox = _compute_bbox(items, crs)
+    return GeoBox.from_bbox(_bbox, resolution=resolution, anchor=anchor)

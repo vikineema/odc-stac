@@ -34,6 +34,7 @@ SESSION_KEYS = (
     "AWS_REGION",
     "AWS_S3_ENDPOINT",
     "AWS_NO_SIGN_REQUEST",
+    "AWS_REQUEST_PAYER",
     "AZURE_STORAGE_ACCOUNT",
     "AZURE_NO_SIGN_REQUEST",
     "OSS_ENDPOINT",
@@ -162,6 +163,8 @@ def rio_env(session=None, **kw):
 
     re-uses GDAL environment and session between calls.
     """
+    if session is None:
+        session = kw.pop("_aws", None)
     return rasterio.env.Env(_local.session(session), **kw)
 
 
@@ -246,7 +249,13 @@ def configure_s3_access(
     :returns: credentials object or ``None`` if ``aws_unsigned=True``
     """
     # pylint: disable=import-outside-toplevel
-    from ._aws import get_aws_settings
+    try:
+        from ._aws import get_aws_settings
+    except ImportError as e:
+        raise ImportError(
+            "botocore is required to configure s3 access. "
+            "Install botocore directly or via `pip install 'odc-stac[botocore]'"
+        ) from e
 
     aws, creds = get_aws_settings(
         profile=profile,

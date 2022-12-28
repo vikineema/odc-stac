@@ -5,13 +5,15 @@ Utilities for reading pixels from raster files.
 - read + reproject
 """
 
+import logging
 import math
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy as np
 import rasterio
 import rasterio.enums
 import rasterio.warp
+from odc.geo.converters import rio_geobox
 from odc.geo.geobox import GeoBox
 from odc.geo.overlap import ReprojectInfo, compute_reproject_roi
 from odc.geo.roi import NormalizedROI, roi_is_empty, roi_shape, w_
@@ -19,6 +21,8 @@ from odc.geo.warp import resampling_s2rio
 
 from ._model import RasterLoadParams, RasterSource
 from ._rio import rio_env
+
+log = logging.getLogger(__name__)
 
 
 def _resolve_src_nodata(
@@ -70,10 +74,6 @@ def _pick_overview(read_shrink: int, overviews: List[int]) -> Optional[int]:
     return _idx
 
 
-def _rio_geobox(src: rasterio.DatasetReader) -> GeoBox:
-    return GeoBox(src.shape, src.transform, src.crs)
-
-
 def _same_nodata(a: Optional[float], b: Optional[float]) -> bool:
     if a is None:
         return b is None
@@ -92,6 +92,12 @@ def _nodata_mask(pix: np.ndarray, nodata: Optional[float]) -> np.ndarray:
     if nodata is None:
         return np.zeros_like(pix, dtype="bool")
     return pix == nodata
+
+
+def _reproject_info_from_rio(
+    rdr: rasterio.DatasetReader, dst_geobox: GeoBox, ttol: float
+) -> ReprojectInfo:
+    return compute_reproject_roi(rio_geobox(rdr), dst_geobox, ttol=ttol)
 
 
 def _do_read(
@@ -148,23 +154,6 @@ def _do_read(
     return (rr.roi_dst, _dst)
 
 
-def src_geobox(src: Union[str, RasterSource]) -> GeoBox:
-    """
-    Get GeoBox of the source.
-
-    1. If src is RasterSource with .geobox populated return that
-    2. Else open file and read it
-    """
-    if isinstance(src, RasterSource):
-        if src.geobox is not None:
-            return src.geobox
-
-        src = src.uri
-
-    with rasterio.open(src, "r") as f:
-        return _rio_geobox(f)
-
-
 def rio_read(
     src: RasterSource,
     cfg: RasterLoadParams,
@@ -192,6 +181,37 @@ def rio_read(
            mosaic[roi] = pix  # if sources are true tiles (no overlaps)
 
     """
+
+    try:
+        return _rio_read(src, cfg, dst_geobox, dst)
+    except rasterio.errors.RasterioIOError as e:
+        if cfg.fail_on_error:
+            log.error(
+                "Aborting load due to failure while reading: %s:%d",
+                src.uri,
+                src.band,
+            )
+            raise e
+
+    # Failed to read, but asked to continue
+    log.warning("Ignoring read failure while reading: %s:%d", src.uri, src.band)
+
+    # TODO: capture errors somehow
+
+    if dst is not None:
+        out = dst[0:0, 0:0]
+    else:
+        out = np.ndarray((0, 0), dtype=cfg.dtype)
+
+    return np.s_[0:0, 0:0], out
+
+
+def _rio_read(
+    src: RasterSource,
+    cfg: RasterLoadParams,
+    dst_geobox: GeoBox,
+    dst: Optional[np.ndarray] = None,
+) -> Tuple[NormalizedROI, np.ndarray]:
     # if resampling is `nearest` then ignore sub-pixel translation when deciding
     # whether we can just paste source into destination
     ttol = 0.9 if cfg.nearest else 0.05
@@ -203,7 +223,7 @@ def rio_read(
         if src.band > rdr.count:
             raise ValueError(f"No band {src.band} in '{src.uri}'")
 
-        rr = compute_reproject_roi(_rio_geobox(rdr), dst_geobox, ttol=ttol)
+        rr = _reproject_info_from_rio(rdr, dst_geobox, ttol=ttol)
 
         if cfg.use_overviews and rr.read_shrink > 1:
             ovr_idx = _pick_overview(rr.read_shrink, rdr.overviews(src.band))
@@ -218,7 +238,7 @@ def rio_read(
         with rasterio.open(
             src.uri, "r", sharing=False, overview_level=ovr_idx
         ) as rdr_ovr:
-            rr = compute_reproject_roi(_rio_geobox(rdr_ovr), dst_geobox, ttol=ttol)
+            rr = _reproject_info_from_rio(rdr, dst_geobox, ttol=ttol)
             with rio_env(VSI_CACHE=False):
                 return _do_read(
                     rasterio.band(rdr_ovr, src.band), cfg, dst_geobox, rr, dst=dst

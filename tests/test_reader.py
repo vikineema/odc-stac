@@ -2,6 +2,7 @@ from math import isnan
 
 import numpy as np
 import pytest
+import rasterio
 from numpy import ma
 from numpy.testing import assert_array_equal
 from odc.geo.geobox import GeoBox
@@ -15,7 +16,6 @@ from odc.stac._reader import (
     _resolve_src_nodata,
     _same_nodata,
     rio_read,
-    src_geobox,
 )
 from odc.stac.testing.fixtures import with_temp_tiff
 
@@ -65,18 +65,6 @@ def test_pick_overiew():
     assert _pick_overview(7, [2, 4, 8]) == 1
     assert _pick_overview(8, [2, 4, 8]) == 2
     assert _pick_overview(20, [2, 4, 8]) == 2
-
-
-def test_src_geobox():
-    gbox = GeoBox.from_bbox((-180, -90, 180, 90), shape=(160, 320), tight=True)
-    assert src_geobox(RasterSource("some.tif", geobox=gbox)) is gbox
-
-    xx = xr_zeros(gbox, dtype="int16")
-    assert xx.odc.geobox == gbox
-
-    with with_temp_tiff(xx, compress=None) as uri:
-        assert src_geobox(uri) == gbox
-        assert src_geobox(RasterSource(uri)) == gbox
 
 
 def test_rio_read():
@@ -209,3 +197,26 @@ def test_reader_unhappy_paths():
         # no such band error
         with pytest.raises(ValueError):
             _, _ = rio_read(src, cfg, gbox)
+
+
+def test_reader_fail_on_error():
+    gbox = GeoBox.from_bbox((-180, -90, 180, 90), shape=(160, 320), tight=True)
+    xx = xr_zeros(gbox, dtype="int16")
+    src = RasterSource("file:///no-such-path/no-such.tif")
+    cfg = RasterLoadParams(dtype=str(xx.dtype), fail_on_error=True)
+
+    # check that it raises error when fail_on_error=True
+    with pytest.raises(rasterio.errors.RasterioIOError):
+        _, _ = rio_read(src, cfg, gbox)
+
+    # check that errors are suppressed when fail_on_error=False
+    cfg = RasterLoadParams(dtype=str(xx.dtype), fail_on_error=False)
+    roi, yy = rio_read(src, cfg, gbox)
+    assert yy.shape == (0, 0)
+    assert yy.dtype == cfg.dtype
+    assert roi == np.s_[0:0, 0:0]
+
+    roi, yy = rio_read(src, cfg, gbox, dst=xx.data)
+    assert yy.shape == (0, 0)
+    assert yy.dtype == cfg.dtype
+    assert roi == np.s_[0:0, 0:0]
